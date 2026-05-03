@@ -33,19 +33,6 @@
 //!
 //! The converter relies on semantic analysis performed by compiler interpreters to properly
 //! classify command-line arguments instead of checking raw flag strings.
-//!
-//! # Example
-//!
-//! ```rust
-//! use bear::output::clang::converter::CommandConverter;
-//! use bear::config::Format;
-//!
-//! let config = Format::default();
-//! let converter = CommandConverter::new(config);
-//!
-//! // The converter can be used to convert semantic Command instances
-//! // into compilation database entries based on the configured format
-//! ```
 
 use super::Entry;
 use super::path_format::{ResolveFn, resolver_for};
@@ -87,12 +74,7 @@ impl CommandConverter {
     }
 
     /// Converts a compiler command into compilation database entries.
-    pub fn to_entries(&self, command: &Command) -> Vec<Entry> {
-        self.convert_compiler_command(command)
-    }
-
-    /// Converts a compiler command into compilation database entries.
-    fn convert_compiler_command(&self, cmd: &Command) -> Vec<Entry> {
+    pub fn convert(&self, cmd: &Command) -> Vec<Entry> {
         // Check if we should skip entry generation for this command
         if self.should_skip_entry_generation(cmd) {
             return vec![];
@@ -402,9 +384,12 @@ mod tests {
             ],
         );
 
-        let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
-        let converter = CommandConverter::new(format);
-        let entries = converter.to_entries(&command);
+        let sut = {
+            let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
+            CommandConverter::new(format)
+        };
+
+        let result = sut.convert(&command);
 
         let expected = vec![Entry::from_arguments_str(
             "main.c",
@@ -412,7 +397,7 @@ mod tests {
             "/home/user",
             Some("main.o"),
         )];
-        assert_eq!(entries, expected);
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -428,9 +413,12 @@ mod tests {
             ],
         );
 
-        let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
-        let converter = CommandConverter::new(format);
-        let result = converter.to_entries(&command);
+        let sut = {
+            let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
+            CommandConverter::new(format)
+        };
+
+        let result = sut.convert(&command);
 
         let expected = vec![
             Entry::from_arguments_str(
@@ -457,9 +445,12 @@ mod tests {
             vec![(ArgumentKind::Other(PassEffect::InfoAndExit), vec!["--version"])],
         );
 
-        let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
-        let converter = CommandConverter::new(format);
-        let result = converter.to_entries(&command);
+        let sut = {
+            let format = Format { paths: PathFormat::default(), entries: EntryFormat::default() };
+            CommandConverter::new(format)
+        };
+
+        let result = sut.convert(&command);
 
         let expected: Vec<Entry> = vec![];
         assert_eq!(result, expected);
@@ -477,12 +468,16 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "main.o"]),
             ],
         );
-        let format = Format {
-            paths: PathFormat::default(),
-            entries: EntryFormat { include_output_field: true, use_array_format: false },
+
+        let sut = {
+            let format = Format {
+                paths: PathFormat::default(),
+                entries: EntryFormat { include_output_field: true, use_array_format: false },
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
-        let entries = converter.to_entries(&command);
+
+        let result = sut.convert(&command);
 
         let expected = vec![Entry::from_command_str(
             "main.c",
@@ -490,7 +485,7 @@ mod tests {
             "/home/user",
             Some("main.o"),
         )];
-        assert_eq!(entries, expected);
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -505,12 +500,16 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "main.o"]),
             ],
         );
-        let format = Format {
-            paths: PathFormat::default(),
-            entries: EntryFormat { use_array_format: true, include_output_field: false },
+
+        let sut = {
+            let format = Format {
+                paths: PathFormat::default(),
+                entries: EntryFormat { use_array_format: true, include_output_field: false },
+            };
+            CommandConverter::new(format)
         };
-        let sut = CommandConverter::new(format);
-        let result = sut.to_entries(&command);
+
+        let result = sut.convert(&command);
 
         let expected = vec![Entry::from_arguments_str(
             "main.c",
@@ -524,13 +523,15 @@ mod tests {
     #[test]
     fn test_command_converter_public_api() {
         // Test that CommandConverter can be used as a public API
-        let format = Format {
-            paths: PathFormat::default(),
-            entries: EntryFormat { use_array_format: true, include_output_field: false },
+        let sut = {
+            let format = Format {
+                paths: PathFormat::default(),
+                entries: EntryFormat { use_array_format: true, include_output_field: false },
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "/usr/bin/gcc",
             vec![
@@ -538,18 +539,17 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["test.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let entries = converter.to_entries(&command);
+        let result = sut.convert(&command);
 
-        assert_eq!(entries.len(), 1);
+        assert_eq!(result.len(), 1);
         // Verify the entry is valid using the public API
-        assert!(entries[0].validate().is_ok());
+        assert!(result[0].validate().is_ok());
     }
 
     #[test]
     fn test_directory_format_failure_yields_no_entries() {
-        let converter = CommandConverter::from_resolvers(
+        let sut = CommandConverter::from_resolvers(
             EntryFormat::default(),
             resolver_always_fails,
             resolver_identity,
@@ -559,12 +559,12 @@ mod tests {
             "/usr/bin/gcc",
             vec![(ArgumentKind::Source { binary: false }, vec!["main.c"])],
         );
-        assert!(converter.to_entries(&cmd).is_empty());
+        assert!(sut.convert(&cmd).is_empty());
     }
 
     #[test]
     fn test_file_format_failure_falls_back_to_original_path() {
-        let converter = CommandConverter::from_resolvers(
+        let sut = CommandConverter::from_resolvers(
             EntryFormat::default(),
             resolver_identity,
             resolver_always_fails,
@@ -575,7 +575,7 @@ mod tests {
             vec![(ArgumentKind::Source { binary: false }, vec!["nonexistent.c"])],
         );
 
-        let entries = converter.to_entries(&cmd);
+        let entries = sut.convert(&cmd);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].directory, PathBuf::from("/home/user"));
         assert_eq!(entries[0].file, PathBuf::from("nonexistent.c"));
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_output_format_failure_falls_back_only_for_output() {
-        let converter = CommandConverter::from_resolvers(
+        let sut = CommandConverter::from_resolvers(
             EntryFormat { include_output_field: true, use_array_format: true },
             resolver_identity,
             resolver_fail_for_object_files,
@@ -597,7 +597,7 @@ mod tests {
             ],
         );
 
-        let entries = converter.to_entries(&cmd);
+        let entries = sut.convert(&cmd);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file, PathBuf::from("main.c"));
         assert_eq!(entries[0].output, Some(PathBuf::from("main.o")));
@@ -605,10 +605,12 @@ mod tests {
 
     #[test]
     fn test_preprocessing_only_command_no_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -616,19 +618,20 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn test_linking_only_command_no_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Linking object files (no -c flag, object file inputs)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -638,18 +641,19 @@ mod tests {
                 (ArgumentKind::Other(PassEffect::Configures(CompilerPass::Linking)), vec!["-L/usr/lib"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn test_compile_only_command_generates_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -658,22 +662,23 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "main.o"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file, PathBuf::from("main.c"));
     }
 
     #[test]
     fn test_compile_and_link_filters_linking_flags() {
-        let format = Format {
-            paths: PathFormat::default(),
-            entries: EntryFormat { use_array_format: true, include_output_field: false },
+        let sut = {
+            let format = Format {
+                paths: PathFormat::default(),
+                entries: EntryFormat { use_array_format: true, include_output_field: false },
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -683,9 +688,8 @@ mod tests {
                 (ArgumentKind::Other(PassEffect::Configures(CompilerPass::Compiling)), vec!["-Wall"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 1);
 
         let entry = &result[0];
@@ -700,27 +704,30 @@ mod tests {
 
     #[test]
     fn test_info_command_no_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![(ArgumentKind::Other(PassEffect::InfoAndExit), vec!["--version"])],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn test_realistic_source_file_detection() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Test compile-and-link with real source files (should generate entries)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -729,13 +736,12 @@ mod tests {
                 (ArgumentKind::Other(PassEffect::Configures(CompilerPass::Linking)), vec!["-lm"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 2); // Should generate entries for both source files
 
         // Test linking with object files only (should not generate entries)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -744,23 +750,24 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "program"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0); // Should not generate entries for object files
     }
 
     #[test]
     fn test_semantic_classification_vs_raw_flags() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Test that we rely on semantic classification, not raw flag strings
         // This tests a hypothetical case where a flag might look like "-E" but
         // is classified differently by semantic analysis
 
         // Test preprocessing flag properly classified
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -771,12 +778,11 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0); // Should skip preprocessing commands
 
         // Test compilation flag properly classified
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -787,12 +793,11 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 1); // Should generate entry for compilation
 
         // Test info flag properly classified
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![(
@@ -800,12 +805,11 @@ mod tests {
                 vec!["--version"], // Semantically classified as info
             )],
         );
-        let command = compiler_cmd;
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 0); // Should skip info commands
 
         // Test that linking flags are filtered out (not raw string matching)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -820,8 +824,7 @@ mod tests {
                 ),
             ],
         );
-        let command = compiler_cmd;
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 1);
 
         // Verify linking flag is filtered out while compilation flag remains
@@ -832,14 +835,16 @@ mod tests {
 
     #[test]
     fn test_consistent_formatting_methods() {
-        let format = Format {
-            paths: PathFormat::default(),
-            entries: EntryFormat { use_array_format: true, include_output_field: true },
+        let sut = {
+            let format = Format {
+                paths: PathFormat::default(),
+                entries: EntryFormat { use_array_format: true, include_output_field: true },
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
         // Test that all three formatting methods work consistently
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -849,9 +854,8 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "main.o"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
         assert_eq!(result.len(), 1);
 
         let entry = &result[0];
@@ -876,11 +880,13 @@ mod tests {
 
     #[test]
     fn test_preprocessing_and_compilation_flags_generates_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Test command with both preprocessing flags (-D) and compilation flags (-c)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -893,9 +899,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["test.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
 
         // Should generate entries because it has compilation flags, not just preprocessing
         assert_eq!(result.len(), 1);
@@ -913,11 +918,13 @@ mod tests {
 
     #[test]
     fn test_preprocessing_only_with_defines_no_entries() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Test command with only preprocessing flags (no -c flag)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -930,9 +937,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["test.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
 
         // Should NOT generate entries because it's preprocessing-only (has -E flag)
         assert_eq!(result.len(), 0);
@@ -949,13 +955,15 @@ mod tests {
         // Create actual source file so canonicalize can work if needed
         std::fs::write(temp_path.join("main.c"), "").unwrap();
 
-        let format = Format {
-            paths: PathFormat { directory: PathResolver::Absolute, file: PathResolver::Absolute },
-            entries: EntryFormat::default(),
+        let sut = {
+            let format = Format {
+                paths: PathFormat { directory: PathResolver::Absolute, file: PathResolver::Absolute },
+                entries: EntryFormat::default(),
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             working_dir,
             "/usr/bin/gcc",
             vec![
@@ -965,9 +973,8 @@ mod tests {
                 (ArgumentKind::Output, vec!["-o", "main.o"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let entries = converter.to_entries(&command);
+        let entries = sut.convert(&command);
         assert_eq!(entries.len(), 1);
 
         let entry = &entries[0];
@@ -986,14 +993,16 @@ mod tests {
         let source_file = temp_path.join("main.c");
         std::fs::write(&source_file, "").unwrap();
 
-        let format = Format {
-            paths: PathFormat { directory: PathResolver::Relative, file: PathResolver::Relative },
-            entries: EntryFormat::default(),
+        let sut = {
+            let format = Format {
+                paths: PathFormat { directory: PathResolver::Relative, file: PathResolver::Relative },
+                entries: EntryFormat::default(),
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
         // Use a relative source file (relative to working dir)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             working_dir,
             "/usr/bin/gcc",
             vec![
@@ -1002,9 +1011,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let entries = converter.to_entries(&command);
+        let entries = sut.convert(&command);
         assert_eq!(entries.len(), 1);
 
         let entry = &entries[0];
@@ -1029,13 +1037,15 @@ mod tests {
         let working_dir_with_dotdot = sub_dir.join("..").join("src");
         let working_dir_str = working_dir_with_dotdot.to_str().unwrap();
 
-        let format = Format {
-            paths: PathFormat { directory: PathResolver::Canonical, file: PathResolver::Canonical },
-            entries: EntryFormat::default(),
+        let sut = {
+            let format = Format {
+                paths: PathFormat { directory: PathResolver::Canonical, file: PathResolver::Canonical },
+                entries: EntryFormat::default(),
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             working_dir_str,
             "/usr/bin/gcc",
             vec![
@@ -1044,9 +1054,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec![source_file.to_str().unwrap()]),
             ],
         );
-        let command = compiler_cmd;
 
-        let entries = converter.to_entries(&command);
+        let entries = sut.convert(&command);
         assert_eq!(entries.len(), 1);
 
         let entry = &entries[0];
@@ -1065,13 +1074,15 @@ mod tests {
 
         std::fs::write(temp_path.join("main.c"), "").unwrap();
 
-        let format = Format {
-            paths: PathFormat { directory: PathResolver::Absolute, file: PathResolver::Relative },
-            entries: EntryFormat::default(),
+        let sut = {
+            let format = Format {
+                paths: PathFormat { directory: PathResolver::Absolute, file: PathResolver::Relative },
+                entries: EntryFormat::default(),
+            };
+            CommandConverter::new(format)
         };
-        let converter = CommandConverter::new(format);
 
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             working_dir,
             "/usr/bin/gcc",
             vec![
@@ -1080,9 +1091,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let entries = converter.to_entries(&command);
+        let entries = sut.convert(&command);
         assert_eq!(entries.len(), 1);
 
         let entry = &entries[0];
@@ -1094,11 +1104,13 @@ mod tests {
 
     #[test]
     fn test_driver_option_does_not_affect_entry_generation() {
-        let format = Format::default();
-        let converter = CommandConverter::new(format);
+        let sut = {
+            let format = Format::default();
+            CommandConverter::new(format)
+        };
 
         // Test command with driver options like -pipe (should still generate entries)
-        let compiler_cmd = Command::from_strings(
+        let command = Command::from_strings(
             "/home/user",
             "gcc",
             vec![
@@ -1108,9 +1120,8 @@ mod tests {
                 (ArgumentKind::Source { binary: false }, vec!["main.c"]),
             ],
         );
-        let command = compiler_cmd;
 
-        let result = converter.to_entries(&command);
+        let result = sut.convert(&command);
 
         // Should generate entries - driver options don't stop compilation
         assert_eq!(result.len(), 1);

@@ -26,7 +26,7 @@ impl<T: IteratorWriter<clang::Entry>> IteratorWriter<semantic::Command> for Conv
     fn write(self, semantics: impl Iterator<Item = semantic::Command>) -> Result<(), WriterError> {
         let stats = Arc::clone(&self.stats);
 
-        let entries = semantics.flat_map(|cmd| self.converter.to_entries(&cmd));
+        let entries = semantics.flat_map(|cmd| self.converter.convert(&cmd));
         let counted_entries = entries.inspect(move |_| {
             stats.compilation_entries_produced.fetch_add(1, Ordering::Relaxed);
         });
