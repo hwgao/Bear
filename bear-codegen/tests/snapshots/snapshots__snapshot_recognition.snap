@@ -5,7 +5,6 @@ expression: generate_recognition_patterns(&raw_tables)
 // Generated from interpreters/*.yaml -- DO NOT EDIT
 pub static RECOGNITION_PATTERNS: &[(&str, &[&str], bool, bool)] = &[
     ("gcc", &["gcc", "g++", "gfortran", "egfortran", "f95"], true, true),
-    ("gcc", &["cc", "c++"], true, false),
     ("gcc", &["cc1", "cc1plus", "cc1obj", "cc1objplus", "f951", "collect2", "lto1"], false, false),
     ("ibm_xl", &["ibm-clang", "ibm-clang++"], false, true),
     ("ibm_xl", &["xlclang", "xlclang++"], false, true),

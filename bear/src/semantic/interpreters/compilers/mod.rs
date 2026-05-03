@@ -8,7 +8,8 @@
 
 pub mod compiler_recognition;
 mod flag_based;
-pub mod wrapper;
+mod probe;
+mod wrapper;
 
 use super::super::{Interpreter, RecognizeResult};
 use super::combinators::OutputLogger;
@@ -16,34 +17,24 @@ use crate::config::CompilerType;
 use crate::intercept::Execution;
 use compiler_recognition::CompilerRecognizer;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-use wrapper::WrapperInterpreter;
 
 /// Main compiler interpreter that delegates to specific compiler implementations.
 ///
-/// This interpreter uses a map-based architecture where each compiler type
-/// is stored in a map for delegation. All interpreters are treated uniformly.
+/// `recognize` runs the recognizer to classify the executable, transparently
+/// peels off any wrapper layer (ccache/distcc/sccache) via [`wrapper::unwrap`],
+/// then dispatches to the per-type flag interpreter.
 pub struct CompilerInterpreter {
-    /// Compiler recognizer for identifying compiler types
-    recognizer: Arc<CompilerRecognizer>,
-    /// Map of compiler types to their interpreters (includes all types)
+    recognizer: CompilerRecognizer,
     interpreters: HashMap<CompilerType, Box<dyn Interpreter>>,
-    /// Wrapper interpreter stored separately to handle circular dependency
-    wrapper_interpreter: OnceLock<Box<dyn Interpreter>>,
 }
 
 impl CompilerInterpreter {
-    /// Factory method that creates a fully configured compiler interpreter.
-    ///
-    /// This method creates the interpreter and registers all supported
-    /// compiler types, including wrapper support with proper circular dependency handling.
-    pub fn new_with_config(compilers: &[crate::config::Compiler]) -> Arc<Self> {
-        let recognizer = Arc::new(CompilerRecognizer::new_with_config(compilers));
+    /// Builds a fully configured compiler interpreter with every supported
+    /// compiler type registered.
+    pub fn new_with_config(compilers: &[crate::config::Compiler]) -> Self {
+        let mut result =
+            Self { recognizer: CompilerRecognizer::new_with_config(compilers), interpreters: HashMap::new() };
 
-        // Create the final interpreter and register all non-wrapper interpreters
-        let mut result = Self::new(Arc::clone(&recognizer));
-
-        // Register all interpreter types using factory functions
         result.register(CompilerType::Gcc, flag_based::gcc());
         result.register(CompilerType::Clang, flag_based::clang());
         result.register(CompilerType::Flang, flag_based::flang());
@@ -57,32 +48,11 @@ impl CompilerInterpreter {
         result.register(CompilerType::Armclang, flag_based::armclang());
         result.register(CompilerType::IbmXl, flag_based::ibm_xl());
 
-        Arc::new_cyclic(|weak_self| {
-            // Create wrapper interpreter with weak references
-            let wrapper_interpreter = WrapperInterpreter::new(
-                Arc::downgrade(&recognizer),
-                weak_self.clone() as std::sync::Weak<dyn Interpreter>,
-            );
-
-            // Store wrapper interpreter in OnceLock
-            let _ = result
-                .wrapper_interpreter
-                .set(Box::new(OutputLogger::new(wrapper_interpreter, CompilerType::Wrapper.to_string())));
-
-            result
-        })
+        result
     }
 
-    /// Creates a new compiler interpreter with empty interpreter map.
-    ///
-    /// This is the basic constructor. Use `new_with_config` for a fully
-    /// configured interpreter with all compiler types registered.
-    fn new(recognizer: Arc<CompilerRecognizer>) -> Self {
-        Self { recognizer, interpreters: HashMap::new(), wrapper_interpreter: OnceLock::new() }
-    }
-
-    /// Registers an interpreter for a specific compiler type.
-    /// The interpreter will be automatically wrapped with OutputLogger using the compiler type name.
+    /// Registers an interpreter for a specific compiler type, wrapping it
+    /// with [`OutputLogger`] so its recognition result is traced.
     fn register(&mut self, compiler_type: CompilerType, interpreter: impl Interpreter + 'static) {
         let logged_interpreter = OutputLogger::new(interpreter, compiler_type.to_string());
         self.interpreters.insert(compiler_type, Box::new(logged_interpreter));
@@ -91,33 +61,30 @@ impl CompilerInterpreter {
 
 impl Default for CompilerInterpreter {
     fn default() -> Self {
-        Self::new(Arc::new(CompilerRecognizer::new_with_config(&[])))
+        Self::new_with_config(&[])
     }
 }
 
 impl Interpreter for CompilerInterpreter {
     fn recognize(&self, execution: Execution) -> RecognizeResult {
-        let Some(compiler_type) = self.recognizer.recognize(&execution.executable) else {
-            return RecognizeResult::NotRecognized(execution);
+        // Classify the executable, peeling off a wrapper layer in place if
+        // needed. ccache/distcc/sccache aren't real compilers; they exist
+        // to carry one in argv. wrapper::unwrap returns both the unwrapped
+        // execution and the inner compiler's type so we don't have to
+        // re-run the recognizer after unwrapping.
+        let (execution, compiler_type) = match self.recognizer.recognize(&execution.executable) {
+            Some(CompilerType::Wrapper) => match wrapper::unwrap(execution, &self.recognizer) {
+                Ok(unwrapped) => unwrapped,
+                Err(execution) => return RecognizeResult::NotRecognized(execution),
+            },
+            Some(ty) => (execution, ty),
+            None => return RecognizeResult::NotRecognized(execution),
         };
-
-        if matches!(compiler_type, CompilerType::Wrapper) {
-            return match self.wrapper_interpreter.get() {
-                Some(wrapper) => wrapper.recognize(execution),
-                None => RecognizeResult::NotRecognized(execution),
-            };
-        }
 
         match self.interpreters.get(&compiler_type) {
             Some(interpreter) => interpreter.recognize(execution),
             None => RecognizeResult::NotRecognized(execution),
         }
-    }
-}
-
-impl Interpreter for Arc<CompilerInterpreter> {
-    fn recognize(&self, execution: Execution) -> RecognizeResult {
-        (**self).recognize(execution)
     }
 }
 

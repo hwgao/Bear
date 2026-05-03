@@ -1,382 +1,229 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Wrapper interpreter for handling compiler wrappers like ccache, distcc, and sccache.
+//! Compiler wrapper handling for ccache, distcc, and sccache.
 //!
-//! This module provides support for recognizing and processing compiler wrappers that
-//! act as intermediaries between build systems and actual compilers. The interpreter
-//! extracts the real compiler from wrapper invocations and delegates to the main
-//! CompilerInterpreter for processing the real compiler command.
+//! Wrappers sit between the build system and the real compiler:
+//! `ccache gcc -c main.c`. The job here is small: detect the wrapper by
+//! basename, locate the real compiler in argv (skipping wrapper-specific
+//! flags like `distcc -j 4`), and produce a fresh [`Execution`] that
+//! names the real compiler. The caller (`CompilerInterpreter::recognize`)
+//! then dispatches that execution as if the wrapper had never been there.
+//!
+//! This module is the authority on what counts as a wrapper:
+//! [`WRAPPER_NAMES`] is shared with `compiler_recognition` for the
+//! recognizer's regex pattern and probe guard.
 
 use super::compiler_recognition::CompilerRecognizer;
 use crate::config::CompilerType;
 use crate::intercept::Execution;
-use crate::semantic::{Interpreter, RecognizeResult};
 
 use std::path::{Path, PathBuf};
-use std::sync::Weak;
 
-/// Interpreter for compiler wrappers (ccache, distcc, sccache).
+/// Wrapper executable basenames. Single source of truth; consumed by
+/// [`CompilerRecognizer`] to build the regex that classifies wrappers and
+/// to skip them during the `--version` probe.
+pub(super) const WRAPPER_NAMES: &[&str] = &["ccache", "distcc", "sccache"];
+
+/// Try to strip a wrapper from `execution`, returning the inner compiler
+/// invocation along with its recognized [`CompilerType`].
 ///
-/// This interpreter handles the complexity of extracting the real compiler from
-/// wrapper invocations and delegates to the main CompilerInterpreter via weak references.
-/// It supports both explicit wrapper usage (e.g., `ccache gcc`) and
-/// masquerading setups where the wrapper is symlinked as the compiler name.
-pub struct WrapperInterpreter {
-    recognizer: Weak<CompilerRecognizer>,
-    delegate: Weak<dyn Interpreter>,
-}
+/// Returns `Ok((inner, ty))` when `execution` is a wrapper invocation we
+/// recognize and the inner argv names a real (non-wrapper) compiler;
+/// `ty` is the inner compiler's type so the caller can dispatch without
+/// re-running the recognizer.
+///
+/// Returns `Err(execution)` -- handing the original execution back -- in
+/// every other case: not a wrapper, missing inner argument, inner not a
+/// compiler, or wrapper-of-wrapper (e.g. `ccache distcc gcc`). The Err
+/// arm lets the caller surface `RecognizeResult::NotRecognized` without
+/// re-cloning the execution.
+pub(super) fn unwrap(
+    execution: Execution,
+    recognizer: &CompilerRecognizer,
+) -> Result<(Execution, CompilerType), Execution> {
+    let Some(wrapper_name) = detect_wrapper_name(&execution.executable) else {
+        return Err(execution);
+    };
 
-impl WrapperInterpreter {
-    /// Creates a new wrapper interpreter with weak references to the recognizer and delegate.
-    pub fn new(recognizer: Weak<CompilerRecognizer>, delegate: Weak<dyn Interpreter>) -> Self {
-        Self { recognizer, delegate }
-    }
+    let Some((real_compiler, filtered_args)) = extract_real_compiler(wrapper_name, &execution.arguments)
+    else {
+        return Err(execution);
+    };
 
-    /// Extracts the real compiler path and filtered arguments from wrapper invocation.
-    fn extract_real_compiler(&self, wrapper_name: &str, args: &[String]) -> Option<(PathBuf, Vec<String>)> {
-        match wrapper_name {
-            "ccache" => self.handle_ccache(args),
-            "distcc" => self.handle_distcc(args),
-            "sccache" => self.handle_sccache(args),
-            _ => None,
-        }
-    }
+    // The inner argv must name a real compiler; reject wrapper-of-wrapper
+    // (which would otherwise loop) and unknown executables.
+    let inner_type = match recognizer.recognize(&real_compiler) {
+        Some(CompilerType::Wrapper) | None => return Err(execution),
+        Some(ty) => ty,
+    };
 
-    /// Handles ccache wrapper invocations.
-    fn handle_ccache(&self, args: &[String]) -> Option<(PathBuf, Vec<String>)> {
-        let recognizer = self.recognizer.upgrade()?;
-
-        if args.len() > 1 {
-            // Explicit compiler - ccache gcc -c main.c
-            let compiler_path = PathBuf::from(&args[1]);
-
-            // Use CompilerRecognizer to validate it's actually a compiler
-            if recognizer.recognize(&compiler_path).is_some() {
-                return Some((compiler_path, args[1..].to_vec()));
-            }
-        }
-
-        None
-    }
-
-    /// Handles sccache wrapper invocations.
-    fn handle_sccache(&self, args: &[String]) -> Option<(PathBuf, Vec<String>)> {
-        // sccache behavior is similar to ccache
-        self.handle_ccache(args)
-    }
-
-    /// Handles distcc wrapper invocations.
-    fn handle_distcc(&self, args: &[String]) -> Option<(PathBuf, Vec<String>)> {
-        // distcc can have its own options before the compiler
-        let compiler_index = {
-            let mut index = 1;
-            while index < args.len() {
-                let arg = &args[index];
-                let arg_count = Self::distcc_option_count(arg);
-                if arg_count > 0 {
-                    index += arg_count;
-                } else {
-                    break;
-                }
-            }
-
-            index
-        };
-
-        if compiler_index < args.len() {
-            let compiler_path = PathBuf::from(&args[compiler_index]);
-
-            let recognizer = self.recognizer.upgrade()?;
-            if recognizer.recognize(&compiler_path).is_some() {
-                return Some((compiler_path, args[compiler_index..].to_vec()));
-            }
-        }
-
-        None
-    }
-
-    /// Detects the wrapper type from the executable name.
-    fn detect_wrapper_name(executable: &Path) -> Option<String> {
-        let name = executable.file_stem()?.to_str()?;
-        match name {
-            "ccache" | "distcc" | "sccache" => Some(name.to_string()),
-            _ => None,
-        }
-    }
-
-    /// Checks if an argument is a distcc-specific option.
-    fn distcc_option_count(arg: &str) -> usize {
-        match arg {
-            "-j" | "--jobs" => 2,
-            "-v" | "--verbose" | "-i" | "--show-hosts" | "--scan-avail" | "--show-principal" => 1,
-            _ => 0,
-        }
-    }
-}
-
-impl Interpreter for WrapperInterpreter {
-    /// Unwraps a compiler wrapper invocation and delegates to the real compiler's interpreter.
-    ///
-    /// Wrapper tools (ccache, distcc, sccache) sit between the build system and the
-    /// real compiler: `ccache gcc -c main.c`. This method:
-    ///
-    /// 1. Detects the wrapper by executable name (ccache, distcc, sccache).
-    /// 2. Extracts the real compiler path and its arguments, stripping wrapper-specific
-    ///    flags (e.g. distcc's `-j 4`).
-    /// 3. Validates the real compiler is a known compiler type (not another wrapper,
-    ///    to prevent infinite recursion in `ccache distcc gcc` chains).
-    /// 4. Builds a new Execution with the real compiler as executable, moving the
-    ///    working directory and environment from the original execution.
-    /// 5. Delegates to the parent CompilerInterpreter (via weak reference) to parse
-    ///    the real compiler's flags with the appropriate flag table.
-    fn recognize(&self, execution: Execution) -> RecognizeResult {
-        // 1. Is the executable a known wrapper?
-        let Some(wrapper_name) = Self::detect_wrapper_name(&execution.executable) else {
-            return RecognizeResult::NotRecognized(execution);
-        };
-
-        // 2. Extract the real compiler and its arguments from the wrapper invocation.
-        let Some((real_compiler_path, filtered_args)) =
-            self.extract_real_compiler(&wrapper_name, &execution.arguments)
-        else {
-            return RecognizeResult::NotRecognized(execution);
-        };
-
-        // 3. Verify the extracted compiler is a real compiler, not another wrapper.
-        //    (Prevents infinite delegation for `ccache distcc gcc ...`.)
-        let Some(recognizer) = self.recognizer.upgrade() else {
-            return RecognizeResult::NotRecognized(execution);
-        };
-        let Some(compiler_type) = recognizer.recognize(&real_compiler_path) else {
-            return RecognizeResult::NotRecognized(execution);
-        };
-        if matches!(compiler_type, CompilerType::Wrapper) {
-            return RecognizeResult::NotRecognized(execution);
-        }
-
-        // 4-5. Rebuild the execution with the real compiler and delegate.
-        let Some(delegate) = self.delegate.upgrade() else {
-            return RecognizeResult::NotRecognized(execution);
-        };
-        let real_execution = Execution {
-            executable: real_compiler_path,
+    Ok((
+        Execution {
+            executable: real_compiler,
             arguments: filtered_args,
             working_dir: execution.working_dir,
             environment: execution.environment,
-        };
-        delegate.recognize(real_execution)
+        },
+        inner_type,
+    ))
+}
+
+/// Identify the wrapper by basename. Returns the static name string so
+/// callers can branch on it without allocating.
+fn detect_wrapper_name(executable: &Path) -> Option<&'static str> {
+    let name = executable.file_stem()?.to_str()?;
+    WRAPPER_NAMES.iter().copied().find(|&w| w == name)
+}
+
+/// Locate the real compiler in a wrapper invocation's argv and return the
+/// surviving argv slice (compiler at index 0). Pure argv parsing -- does
+/// not consult the recognizer; callers are responsible for validating that
+/// the returned path is actually a compiler.
+fn extract_real_compiler(wrapper_name: &str, args: &[String]) -> Option<(PathBuf, Vec<String>)> {
+    match wrapper_name {
+        // ccache and sccache: argv[1] is the real compiler, argv[2..] are
+        // its flags. They have no wrapper-specific flags of their own that
+        // we need to skip.
+        "ccache" | "sccache" => {
+            let inner = args.get(1)?;
+            Some((PathBuf::from(inner), args[1..].to_vec()))
+        }
+        // distcc accepts its own flags before the compiler name. Skip
+        // them (consuming any flag values too) until we find a non-distcc
+        // argv slot, which is the compiler.
+        "distcc" => {
+            let mut i = 1;
+            while i < args.len() {
+                let consumed = distcc_option_count(&args[i]);
+                if consumed == 0 {
+                    break;
+                }
+                i += consumed;
+            }
+            let inner = args.get(i)?;
+            Some((PathBuf::from(inner), args[i..].to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Number of argv slots a distcc-specific option consumes (the flag plus
+/// any value that follows). Zero means the argument is not a distcc option.
+fn distcc_option_count(arg: &str) -> usize {
+    match arg {
+        "-j" | "--jobs" => 2,
+        "-v" | "--verbose" | "-i" | "--show-hosts" | "--scan-avail" | "--show-principal" => 1,
+        _ => 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{Command, MockInterpreter, RecognizeResult};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     fn create_execution(args: Vec<&str>) -> Execution {
         Execution::from_strings(args[0], args, "/project", HashMap::new())
     }
 
-    fn create_sut(
-        mock: impl Interpreter + 'static,
-    ) -> (impl Interpreter, (Arc<CompilerRecognizer>, Arc<impl Interpreter>)) {
-        let recognizer = Arc::new(CompilerRecognizer::new());
-        let delegate = Arc::new(mock);
-
-        let sut = WrapperInterpreter::new(
-            Arc::downgrade(&recognizer),
-            Arc::downgrade(&delegate) as Weak<dyn Interpreter>,
-        );
-
-        (sut, (recognizer, delegate))
-    }
-
     #[test]
     fn test_detect_wrapper_name() {
-        let sut = |path_str| {
-            let path = PathBuf::from(path_str);
-            WrapperInterpreter::detect_wrapper_name(&path)
-        };
+        let sut = |path_str| detect_wrapper_name(Path::new(path_str));
 
-        assert_eq!(sut("/usr/bin/ccache"), Some("ccache".to_string()));
-        assert_eq!(sut("/opt/distcc"), Some("distcc".to_string()));
-        assert_eq!(sut("sccache"), Some("sccache".to_string()));
+        assert_eq!(sut("/usr/bin/ccache"), Some("ccache"));
+        assert_eq!(sut("/opt/distcc"), Some("distcc"));
+        assert_eq!(sut("sccache"), Some("sccache"));
         assert_eq!(sut("/usr/bin/gcc"), None);
         assert_eq!(sut("make"), None);
     }
 
     #[test]
-    fn test_is_distcc_option() {
-        let sut = |arg| WrapperInterpreter::distcc_option_count(arg);
-
-        assert_eq!(2, sut("-j"));
-        assert_eq!(2, sut("--jobs"));
-        assert_eq!(1, sut("-v"));
-        assert_eq!(1, sut("--verbose"));
-        assert_eq!(1, sut("-i"));
-        assert_eq!(1, sut("--show-hosts"));
-        assert_eq!(1, sut("--scan-avail"));
-        assert_eq!(1, sut("--show-principal"));
-        assert_eq!(0, sut("-c"));
-        assert_eq!(0, sut("-Wall"));
-        assert_eq!(0, sut("--output"));
+    fn test_distcc_option_count() {
+        assert_eq!(2, distcc_option_count("-j"));
+        assert_eq!(2, distcc_option_count("--jobs"));
+        assert_eq!(1, distcc_option_count("-v"));
+        assert_eq!(1, distcc_option_count("--verbose"));
+        assert_eq!(1, distcc_option_count("-i"));
+        assert_eq!(1, distcc_option_count("--show-hosts"));
+        assert_eq!(1, distcc_option_count("--scan-avail"));
+        assert_eq!(1, distcc_option_count("--show-principal"));
+        assert_eq!(0, distcc_option_count("-c"));
+        assert_eq!(0, distcc_option_count("-Wall"));
+        assert_eq!(0, distcc_option_count("--output"));
     }
 
     #[test]
-    fn test_recognize_valid_wrapper_calls() {
-        let executions = vec![
-            (create_execution(vec!["ccache", "gcc", "-c", "main.c"]), "gcc"),
-            (create_execution(vec!["/usr/bin/ccache", "gcc", "-c", "main.c"]), "gcc"),
-            (create_execution(vec!["ccache", "/usr/bin/gcc", "-c", "main.c"]), "/usr/bin/gcc"),
-            (create_execution(vec!["ccache", "clang", "-c", "main.c"]), "clang"),
-            (create_execution(vec!["ccache", "/usr/bin/clang", "-c", "main.c"]), "/usr/bin/clang"),
-            (create_execution(vec!["sccache", "gcc", "-c", "main.c"]), "gcc"),
-            (create_execution(vec!["sccache", "clang", "-c", "main.c"]), "clang"),
-            (create_execution(vec!["distcc", "-j", "4", "gcc", "-c", "main.c"]), "gcc"),
-            (create_execution(vec!["distcc", "clang", "-c", "main.c"]), "clang"),
+    fn test_unwrap_extracts_real_compiler_for_valid_wrapper_calls() {
+        let recognizer = CompilerRecognizer::new();
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["ccache", "gcc", "-c", "main.c"], "gcc"),
+            (vec!["/usr/bin/ccache", "gcc", "-c", "main.c"], "gcc"),
+            (vec!["ccache", "/usr/bin/gcc", "-c", "main.c"], "/usr/bin/gcc"),
+            (vec!["ccache", "clang", "-c", "main.c"], "clang"),
+            (vec!["ccache", "/usr/bin/clang", "-c", "main.c"], "/usr/bin/clang"),
+            (vec!["sccache", "gcc", "-c", "main.c"], "gcc"),
+            (vec!["sccache", "clang", "-c", "main.c"], "clang"),
+            (vec!["distcc", "-j", "4", "gcc", "-c", "main.c"], "gcc"),
+            (vec!["distcc", "clang", "-c", "main.c"], "clang"),
         ];
-        let mock = {
-            let mut mock = MockInterpreter::new();
-            mock.expect_recognize().returning(|execution| {
-                RecognizeResult::Recognized(Command::new(execution.working_dir, execution.executable, vec![]))
-            });
 
-            mock
-        };
-
-        let (sut, _context) = create_sut(mock);
-
-        for (execution, compiler) in executions {
-            let result = sut.recognize(execution);
-
-            let RecognizeResult::Recognized(cmd) = result else {
-                panic!("wrapper call should be recognized");
-            };
-            assert_eq!(cmd.executable, PathBuf::from(compiler));
+        for (args, expected_inner) in cases {
+            let exec = create_execution(args.clone());
+            let (inner, _ty) =
+                unwrap(exec, &recognizer).unwrap_or_else(|_| panic!("unwrap should succeed for {:?}", args));
+            assert_eq!(inner.executable, PathBuf::from(expected_inner));
         }
     }
 
     #[test]
-    fn test_recognize_fails_non_wrapper_calls() {
-        let executions = vec![
-            create_execution(vec!["gcc", "-c", "main.c"]),
-            create_execution(vec!["make", "all"]),
-            create_execution(vec!["ccache"]),
-            create_execution(vec!["ccache", "make", "all"]),
-            create_execution(vec!["ccache", "distcc", "gcc", "-c", "main.c"]),
+    fn test_unwrap_rejects_non_wrapper_or_invalid_calls() {
+        let recognizer = CompilerRecognizer::new();
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["gcc", "-c", "main.c"],                     // not a wrapper at all
+            vec!["make", "all"],                             // not a wrapper
+            vec!["ccache"],                                  // wrapper without inner argv
+            vec!["ccache", "make", "all"],                   // inner is not a compiler
+            vec!["ccache", "distcc", "gcc", "-c", "main.c"], // wrapper-of-wrapper
         ];
-        let mock = {
-            let mut mock = MockInterpreter::new();
-            mock.expect_recognize().returning(|execution| {
-                RecognizeResult::Recognized(Command::new(execution.working_dir, execution.executable, vec![]))
-            });
 
-            mock
-        };
-
-        let (sut, _context) = create_sut(mock);
-
-        for execution in executions {
-            let result = sut.recognize(execution);
-
-            assert!(matches!(result, RecognizeResult::NotRecognized(_)), "call should not be recognized");
+        for args in cases {
+            let exec = create_execution(args.clone());
+            assert!(unwrap(exec, &recognizer).is_err(), "unwrap should reject {:?}", args);
         }
     }
 
     #[test]
-    fn test_recognize_preserves_working_dir_and_environment() {
-        let environment = {
-            let mut builder = HashMap::new();
-            builder.insert("CC", "gcc");
-            builder
-        };
-        let execution = Execution::from_strings(
+    fn test_unwrap_preserves_working_dir_and_environment() {
+        let recognizer = CompilerRecognizer::new();
+        let mut env = HashMap::new();
+        env.insert("CC", "gcc");
+        let exec = Execution::from_strings(
             "/usr/bin/ccache",
             vec!["ccache", "gcc", "-c", "main.c"],
             "/custom/dir",
-            environment,
+            env,
         );
 
-        let mock = {
-            let mut mock = MockInterpreter::new();
-            mock.expect_recognize()
-                .withf(|execution| {
-                    *execution.working_dir == *"/custom/dir"
-                        && execution.environment.get("CC") == Some(&"gcc".to_string())
-                })
-                .returning(|execution| {
-                    RecognizeResult::Recognized(Command::new(
-                        execution.working_dir,
-                        execution.executable,
-                        vec![],
-                    ))
-                });
-            mock
-        };
+        let (inner, ty) = unwrap(exec, &recognizer).expect("unwrap should succeed");
 
-        let (sut, _context) = create_sut(mock);
-        let result = sut.recognize(execution);
-
-        assert!(
-            matches!(result, RecognizeResult::Recognized(_)),
-            "Should delegate successfully and preserve execution context"
-        );
+        assert_eq!(inner.working_dir, PathBuf::from("/custom/dir"));
+        assert_eq!(inner.environment.get("CC"), Some(&"gcc".to_string()));
+        assert_eq!(ty, CompilerType::Gcc);
     }
 
     #[test]
-    fn test_recognize_filters_wrapper_args_from_delegated_execution() {
-        let execution = Execution::from_strings(
+    fn test_unwrap_strips_distcc_flags_from_filtered_args() {
+        let recognizer = CompilerRecognizer::new();
+        let exec = Execution::from_strings(
             "/usr/bin/distcc",
             vec!["distcc", "-j", "4", "gcc", "-c", "main.c", "-o", "main.o"],
             "/project",
             HashMap::new(),
         );
 
-        let mock = {
-            let mut mock = MockInterpreter::new();
-            mock.expect_recognize()
-                .withf(|execution| {
-                    *execution.executable == *"gcc"
-                        && execution.arguments == vec!["gcc", "-c", "main.c", "-o", "main.o"]
-                })
-                .returning(|execution| {
-                    RecognizeResult::Recognized(Command::new(
-                        execution.working_dir,
-                        execution.executable,
-                        vec![],
-                    ))
-                });
-            mock
-        };
+        let (inner, _ty) = unwrap(exec, &recognizer).expect("unwrap should succeed");
 
-        let (sut, _context) = create_sut(mock);
-        let result = sut.recognize(execution);
-
-        assert!(
-            matches!(result, RecognizeResult::Recognized(_)),
-            "Wrapper should strip its own args before delegating"
-        );
-    }
-
-    #[test]
-    fn test_recognize_returns_none_when_delegate_rejects() {
-        let execution = create_execution(vec!["ccache", "gcc", "-c", "main.c"]);
-
-        let mock = {
-            let mut delegate = MockInterpreter::new();
-            delegate.expect_recognize().returning(RecognizeResult::NotRecognized);
-
-            delegate
-        };
-
-        let (sut, _context) = create_sut(mock);
-        let result = sut.recognize(execution);
-
-        assert!(
-            matches!(result, RecognizeResult::NotRecognized(_)),
-            "Should return NotRecognized when delegate does not recognize the compiler"
-        );
+        assert_eq!(inner.executable, PathBuf::from("gcc"));
+        assert_eq!(inner.arguments, vec!["gcc", "-c", "main.c", "-o", "main.o"]);
     }
 }

@@ -831,3 +831,95 @@ format:
 
     Ok(())
 }
+
+/// A fake `cc` binary whose basename is the ambiguous name `cc` and whose
+/// `--version` output advertises Clang. Bear must probe the binary, classify
+/// it as Clang (not GCC, which is what the regex would say), and dispatch
+/// to the Clang interpreter. Verified by:
+///   1. an entry for `hello.c` in the compilation database (recognition +
+///      end-to-end pipeline succeeded);
+///   2. a `Clang` debug log line for the cc execution AND no `GCC` log line
+///      (proves dispatch went through the Clang interpreter, not the regex
+///      fallback to GCC).
+// Requirements: recognition-ambiguous-name-probe
+#[cfg(target_family = "unix")]
+#[cfg(has_preload_library)]
+#[cfg(has_executable_shell)]
+#[test]
+fn probe_dispatches_cc_to_clang_when_version_advertises_clang() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnvironment::new("probe_dispatches_cc_to_clang")?;
+
+    env.create_source_files(&[("hello.c", "int main(void) { return 0; }")])?;
+
+    // Fake `cc`: a shell script that prints a Clang version banner on
+    // --version and otherwise exits 0 without touching the source file.
+    // The probe only cares about --version output; the build itself does
+    // not need to produce object code for the recognizer to record an entry.
+    let fake_cc_dir = env.test_dir().join("fake-cc");
+    std::fs::create_dir(&fake_cc_dir)?;
+    let fake_cc = fake_cc_dir.join("cc");
+    std::fs::write(
+        &fake_cc,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+             echo 'clang version 17.0.0 (probe-test)'\n\
+             exit 0\n\
+         fi\n\
+         exit 0\n",
+    )?;
+    std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755))?;
+
+    // Build script prepends the fake-cc dir to PATH so the bare name `cc`
+    // resolves to our script. The preload then records the absolute path
+    // of the fake cc as the execution's executable, basename `cc`, which
+    // is what triggers the probe.
+    let build_commands =
+        format!("PATH=\"{}:$PATH\" cc -c hello.c\n", fake_cc_dir.to_str().expect("test dir is valid UTF-8"),);
+    let script = env.create_shell_script("build.sh", &build_commands)?;
+
+    // Use command_bear() directly so we can force RUST_LOG=debug without
+    // touching the test process env (which would race with parallel tests).
+    let mut cmd = env.command_bear();
+    cmd.current_dir(env.test_dir()).env("RUST_LOG", "debug").env("RUST_BACKTRACE", "1").args([
+        "--output",
+        "compile_commands.json",
+        "--",
+        SHELL_PATH,
+        script.to_str().unwrap(),
+    ]);
+    let output = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "bear failed:\n{}", stderr);
+
+    // (1) Entry for hello.c must exist.
+    let db = env.load_compilation_database("compile_commands.json")?;
+    let hello_entries: Vec<_> =
+        db.entries().iter().filter(|e| e.get("file").and_then(Value::as_str) == Some("hello.c")).collect();
+    assert!(!hello_entries.is_empty(), "expected an entry for hello.c, got entries: {:#?}", db.entries());
+
+    // (2) Dispatch must have gone through the Clang interpreter. The
+    // OutputLogger combinator emits `Clang               : Recognized(...)`
+    // when the Clang flag table parses the command, and `GCC                 :
+    // Recognized(...)` if the GCC flag table did. We assert the former is
+    // present and the latter is absent for this run.
+    //
+    // Note: we look for "Recognized(" specifically to ignore any unrelated
+    // log lines that might mention the type names in passing.
+    let saw_clang_recognized = stderr.lines().any(|l| l.contains("Clang") && l.contains("Recognized("));
+    let saw_gcc_recognized = stderr.lines().any(|l| l.contains("GCC") && l.contains("Recognized("));
+
+    assert!(
+        saw_clang_recognized,
+        "expected a `Clang ... Recognized(` log line proving probe dispatched to Clang.\nstderr:\n{}",
+        stderr
+    );
+    assert!(
+        !saw_gcc_recognized,
+        "did not expect a `GCC ... Recognized(` log line; that would mean the probe was bypassed and the regex fell back to GCC.\nstderr:\n{}",
+        stderr
+    );
+
+    Ok(())
+}

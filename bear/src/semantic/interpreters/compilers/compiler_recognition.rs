@@ -6,101 +6,170 @@
 //! using regular expressions instead of separate hard-coded lists and pattern
 //! matching functions for each compiler.
 
+use super::probe::{CompilerProbe, default_probe};
+use super::wrapper::WRAPPER_NAMES;
 use crate::config::{Compiler, CompilerType};
 use regex_lite::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// Escape regex metacharacters that may appear in compiler executable names.
+/// Basenames whose underlying toolchain cannot be inferred from the name
+/// alone -- `cc` and `c++` resolve to GCC on most Linuxes but Clang on
+/// FreeBSD/OpenBSD/NetBSD/DragonFly and macOS.
 ///
-/// The only metacharacter that actually appears in the YAML-defined executable
-/// names is `+` (e.g. `c++`, `g++`, `clang++`). `regex-lite` does not expose a
-/// public `escape` helper, so we provide a minimal local one.
-fn escape_executable(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c == '+' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
+/// The probe is the sole classifier for these names: there is no regex
+/// fallback (gcc.yaml deliberately omits them). When the probe declines
+/// (timeout, unrecognizable output, spawn failure), `recognize` returns
+/// `None` rather than guessing -- a missing entry is visible and
+/// debuggable, whereas a wrongly-classified entry corrupts the
+/// compilation database silently via mismatched flag-arity tables.
+const AMBIGUOUS_NAMES: &[&str] = &["cc", "c++"];
 
-// Generated recognition pattern data from flags/*.yaml.
-include!(concat!(env!("OUT_DIR"), "/recognition.rs"));
-
-/// Compile-time initialized default regex patterns for compiler recognition.
+/// Recognizes the compiler type for an executable path, using a layered
+/// strategy:
 ///
-/// Built from YAML-defined `recognize` entries plus a hand-written Wrapper pattern.
-/// Each entry maps a `CompilerType` to a regex that matches executable filenames,
-/// supporting cross-compilation prefixes, version suffixes, and `.exe` extensions.
-static DEFAULT_PATTERNS: LazyLock<Vec<(CompilerType, Regex)>> = LazyLock::new(|| {
-    let mut patterns = Vec::new();
-
-    // Build patterns from generated YAML data
-    for &(type_str, executables, cross_compilation, versioned) in RECOGNITION_PATTERNS {
-        let compiler_type = parse_compiler_type(type_str);
-        let regex = create_compiler_regex(executables, cross_compilation, versioned);
-        patterns.push((compiler_type, regex));
-    }
-
-    // Wrapper pattern stays hand-written (not YAML-driven)
-    patterns
-        .push((CompilerType::Wrapper, create_compiler_regex(&["ccache", "distcc", "sccache"], false, false)));
-
-    patterns
-});
-
-/// Map a YAML `type` string to a `CompilerType` variant.
-fn parse_compiler_type(type_str: &str) -> CompilerType {
-    match type_str {
-        "gcc" => CompilerType::Gcc,
-        "clang" => CompilerType::Clang,
-        "flang" => CompilerType::Flang,
-        "intel_fortran" => CompilerType::IntelFortran,
-        "cray_fortran" => CompilerType::CrayFortran,
-        "cuda" => CompilerType::Cuda,
-        "msvc" => CompilerType::Msvc,
-        "clang_cl" => CompilerType::ClangCl,
-        "intel_cc" => CompilerType::IntelCc,
-        "nvidia_hpc" => CompilerType::NvidiaHpc,
-        "armclang" => CompilerType::Armclang,
-        "ibm_xl" => CompilerType::IbmXl,
-        other => panic!("Unknown compiler type in YAML: '{}'", other),
-    }
-}
-
-/// Build a regex that matches any of the given `executables`, with optional
-/// cross-compilation prefix and version suffix support, plus `.exe` extension.
-fn create_compiler_regex(executables: &[&str], cross_compilation: bool, versioned: bool) -> Regex {
-    // Escape for regex (handles '+' in names like "c++", "clang++")
-    let escaped: Vec<String> = executables.iter().map(|n| escape_executable(n)).collect();
-    let alternation = escaped.join("|");
-
-    let base = if cross_compilation {
-        format!(r"(?:[^/]*-)?(?:{})", alternation)
-    } else {
-        format!(r"(?:{})", alternation)
-    };
-
-    let with_version =
-        if versioned { format!(r"{}(?:[-_]?([0-9]+(?:[._-][0-9a-zA-Z]+)*))?", base) } else { base };
-
-    // On Windows, executable names are case-insensitive (CL.EXE, cl.exe, Cl.exe)
-    let case_flag = if cfg!(windows) { "(?i)" } else { "" };
-    let full_pattern = format!(r"^{}{}(?:\.exe)?$", case_flag, with_version);
-    Regex::new(&full_pattern).unwrap_or_else(|_| panic!("Invalid regex pattern: {}", full_pattern))
-}
-
-/// A unified compiler recognizer that uses regex patterns
+/// 1. **Hint lookup** — user-supplied [`Compiler`] entries (canonicalized)
+///    are checked first; a hit short-circuits both probe and regex.
+/// 2. **Probe** — for ambiguous basenames (`cc`, `c++`) the binary is
+///    invoked with `--version` and classified by signature. Memoization
+///    of probe results lives in the probe itself (see
+///    [`super::probe::CachingProbe`]); the recognizer only owns the
+///    dispatch policy.
+/// 3. **Regex fallback** — filename is matched against patterns generated
+///    from `interpreters/*.yaml`. Note that `cc`/`c++` are intentionally
+///    omitted from the regex; if the probe declines, recognition returns
+///    `None` rather than guessing.
 pub struct CompilerRecognizer {
     patterns: Vec<(CompilerType, Regex)>,
     hints: HashMap<PathBuf, CompilerType>,
+    probe: Box<dyn CompilerProbe>,
 }
 
 impl CompilerRecognizer {
+    /// Creates a new compiler recognizer with default patterns and the
+    /// platform-default probe ([`super::probe::default_probe`] -- the real
+    /// `--version` probe on Unix, a no-op on Windows where compiler
+    /// basenames are unambiguous).
+    pub fn new() -> Self {
+        Self::with_probe(&[], default_probe())
+    }
+
+    /// Creates a new compiler recognizer with configuration-based hints.
+    ///
+    /// Uses the platform-default probe; user hints are consulted first and
+    /// short-circuit the probe regardless of platform.
+    ///
+    /// # Arguments
+    ///
+    /// * `compilers` - Slice of compiler configurations with optional type hints
+    pub fn new_with_config(compilers: &[Compiler]) -> Self {
+        Self::with_probe(compilers, default_probe())
+    }
+
+    /// Creates a recognizer with an injectable probe. Used by tests to swap
+    /// in a fake probe that does not fork+exec.
+    pub(crate) fn with_probe(compilers: &[Compiler], probe: Box<dyn CompilerProbe>) -> Self {
+        Self { patterns: DEFAULT_PATTERNS.clone(), hints: Self::build_hints_map(compilers), probe }
+    }
+
+    /// Recognizes the compiler type from an executable path.
+    ///
+    /// Order: configured hints, then `--version` probe (only for the
+    /// ambiguous basename set), then regex.
+    ///
+    /// # Arguments
+    ///
+    /// * `executable_path` - The path to the executable (can be relative or absolute)
+    ///
+    /// # Returns
+    ///
+    /// `Some(CompilerType)` if the executable is recognized, `None` otherwise
+    pub fn recognize(&self, executable_path: &Path) -> Option<CompilerType> {
+        // 1. Check configured hints first (by canonical path matching).
+        //    The user override always wins; it also short-circuits the probe.
+        if let Some(hint_type) = self.lookup_hint(executable_path) {
+            return Some(hint_type);
+        }
+
+        // 2. For known-ambiguous basenames, run the --version probe. The
+        //    probe is what distinguishes BSD/macOS `cc` (Clang) from Linux
+        //    `cc` (GCC). Caching of probe results lives inside the probe
+        //    itself ([`super::probe::CachingProbe`]) so the cost is at most
+        //    one fork+exec per unique compiler path per process.
+        let filename = executable_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if AMBIGUOUS_NAMES.contains(&filename)
+            && let Some(t) = self.probe_canonical(executable_path)
+        {
+            return Some(t);
+        }
+
+        // 3. Fall back to regex-based recognition.
+        self.recognize_by_regex(executable_path)
+    }
+
+    /// Looks up a hint for the given executable path.
+    ///
+    /// Tries both the original path and its canonicalized version.
+    fn lookup_hint(&self, executable_path: &Path) -> Option<CompilerType> {
+        // Try original path first
+        if let Some(&compiler_type) = self.hints.get(executable_path) {
+            return Some(compiler_type);
+        }
+
+        // Try canonicalized path
+        if let Ok(canonical_path) = executable_path.canonicalize()
+            && let Some(&compiler_type) = self.hints.get(&canonical_path)
+        {
+            return Some(compiler_type);
+        }
+
+        None
+    }
+
+    /// Canonicalize `executable_path` and ask the probe to classify it.
+    ///
+    /// Canonicalization happens here (not in the probe) for two reasons:
+    /// the wrapper guard below relies on the canonical basename, and
+    /// canonicalizing before the cache key in
+    /// [`super::probe::CachingProbe`] collapses different argv spellings
+    /// of the same compiler into one cache entry.
+    ///
+    /// Wrapper safety: if the canonical path resolves to a wrapper
+    /// (ccache/distcc/sccache, e.g. via a symlink farm where `cc` ->
+    /// `/usr/lib/ccache/ccache`), do not probe -- the wrapper's
+    /// `--version` reports its own banner, not the compiler's, and we
+    /// want the regex layer to classify it as `CompilerType::Wrapper`
+    /// so the wrapper interpreter unwraps it.
+    fn probe_canonical(&self, executable_path: &Path) -> Option<CompilerType> {
+        let key = executable_path.canonicalize().unwrap_or_else(|_| executable_path.to_path_buf());
+
+        if let Some(name) = key.file_name().and_then(|n| n.to_str())
+            && WRAPPER_NAMES.contains(&name)
+        {
+            return None;
+        }
+
+        self.probe.probe(&key)
+    }
+
+    /// Internal regex-based recognition.
+    ///
+    /// Ignores the directory path and only looks at the filename to
+    /// determine the compiler type using [`DEFAULT_PATTERNS`].
+    fn recognize_by_regex(&self, executable_path: &Path) -> Option<CompilerType> {
+        let filename = executable_path.file_name()?.to_str()?;
+
+        // Check each compiler pattern
+        for (compiler_type, pattern) in &self.patterns {
+            if pattern.is_match(filename) {
+                return Some(*compiler_type);
+            }
+        }
+
+        None
+    }
+
     /// Creates a hint lookup table from compiler configuration.
     ///
     /// This method processes a slice of [`Compiler`] configurations and builds a mapping
@@ -180,82 +249,6 @@ impl CompilerRecognizer {
 
         hints
     }
-
-    /// Creates a new compiler recognizer with default patterns
-    pub fn new() -> Self {
-        Self { patterns: DEFAULT_PATTERNS.clone(), hints: Self::build_hints_map(&[]) }
-    }
-
-    /// Creates a new compiler recognizer with configuration-based hints
-    ///
-    /// # Arguments
-    ///
-    /// * `compilers` - Slice of compiler configurations with optional type hints
-    ///
-    /// # Returns
-    ///
-    /// A new CompilerRecognizer that will prioritize configured hints over regex detection
-    pub fn new_with_config(compilers: &[Compiler]) -> Self {
-        Self { patterns: DEFAULT_PATTERNS.clone(), hints: Self::build_hints_map(compilers) }
-    }
-
-    /// Recognizes the compiler type from an executable path
-    ///
-    /// This function first checks for configured hints, then falls back to
-    /// regex-based detection using the filename.
-    ///
-    /// # Arguments
-    ///
-    /// * `executable_path` - The path to the executable (can be relative or absolute)
-    ///
-    /// # Returns
-    ///
-    /// `Some(CompilerType)` if the executable is recognized, `None` otherwise
-    pub fn recognize(&self, executable_path: &Path) -> Option<CompilerType> {
-        // 1. Check configured hints first (by canonical path matching)
-        if let Some(hint_type) = self.lookup_hint(executable_path) {
-            return Some(hint_type);
-        }
-
-        // 2. Fall back to regex-based recognition
-        self.recognize_by_regex(executable_path)
-    }
-
-    /// Looks up a hint for the given executable path
-    ///
-    /// Tries both the original path and its canonicalized version
-    fn lookup_hint(&self, executable_path: &Path) -> Option<CompilerType> {
-        // Try original path first
-        if let Some(&compiler_type) = self.hints.get(executable_path) {
-            return Some(compiler_type);
-        }
-
-        // Try canonicalized path
-        if let Ok(canonical_path) = executable_path.canonicalize()
-            && let Some(&compiler_type) = self.hints.get(&canonical_path)
-        {
-            return Some(compiler_type);
-        }
-
-        None
-    }
-
-    /// Internal regex-based recognition
-    ///
-    /// This function ignores the directory path and only looks at the filename
-    /// to determine the compiler type using regex patterns.
-    fn recognize_by_regex(&self, executable_path: &Path) -> Option<CompilerType> {
-        let filename = executable_path.file_name()?.to_str()?;
-
-        // Check each compiler pattern
-        for (compiler_type, pattern) in &self.patterns {
-            if pattern.is_match(filename) {
-                return Some(*compiler_type);
-            }
-        }
-
-        None
-    }
 }
 
 impl Default for CompilerRecognizer {
@@ -264,8 +257,97 @@ impl Default for CompilerRecognizer {
     }
 }
 
+// ----- Pattern infrastructure -----------------------------------------
+//
+// Default regex patterns and the helpers that build them. These are
+// implementation details of CompilerRecognizer and are not part of its
+// public surface. The patterns themselves are generated at build time
+// from the YAML files under `bear/interpreters/`.
+
+// Generated recognition pattern data from flags/*.yaml.
+include!(concat!(env!("OUT_DIR"), "/recognition.rs"));
+
+/// Compile-time initialized default regex patterns for compiler recognition.
+///
+/// Built from YAML-defined `recognize` entries plus a hand-written Wrapper pattern.
+/// Each entry maps a `CompilerType` to a regex that matches executable filenames,
+/// supporting cross-compilation prefixes, version suffixes, and `.exe` extensions.
+static DEFAULT_PATTERNS: LazyLock<Vec<(CompilerType, Regex)>> = LazyLock::new(|| {
+    let mut patterns = Vec::new();
+
+    // Build patterns from generated YAML data
+    for &(type_str, executables, cross_compilation, versioned) in RECOGNITION_PATTERNS {
+        let compiler_type = parse_compiler_type(type_str);
+        let regex = create_compiler_regex(executables, cross_compilation, versioned);
+        patterns.push((compiler_type, regex));
+    }
+
+    // Wrapper pattern stays hand-written (not YAML-driven)
+    patterns.push((CompilerType::Wrapper, create_compiler_regex(WRAPPER_NAMES, false, false)));
+
+    patterns
+});
+
+/// Map a YAML `type` string to a `CompilerType` variant.
+fn parse_compiler_type(type_str: &str) -> CompilerType {
+    match type_str {
+        "gcc" => CompilerType::Gcc,
+        "clang" => CompilerType::Clang,
+        "flang" => CompilerType::Flang,
+        "intel_fortran" => CompilerType::IntelFortran,
+        "cray_fortran" => CompilerType::CrayFortran,
+        "cuda" => CompilerType::Cuda,
+        "msvc" => CompilerType::Msvc,
+        "clang_cl" => CompilerType::ClangCl,
+        "intel_cc" => CompilerType::IntelCc,
+        "nvidia_hpc" => CompilerType::NvidiaHpc,
+        "armclang" => CompilerType::Armclang,
+        "ibm_xl" => CompilerType::IbmXl,
+        other => panic!("Unknown compiler type in YAML: '{}'", other),
+    }
+}
+
+/// Build a regex that matches any of the given `executables`, with optional
+/// cross-compilation prefix and version suffix support, plus `.exe` extension.
+fn create_compiler_regex(executables: &[&str], cross_compilation: bool, versioned: bool) -> Regex {
+    // Escape for regex (handles '+' in names like "c++", "clang++")
+    let escaped: Vec<String> = executables.iter().map(|n| escape_executable(n)).collect();
+    let alternation = escaped.join("|");
+
+    let base = if cross_compilation {
+        format!(r"(?:[^/]*-)?(?:{})", alternation)
+    } else {
+        format!(r"(?:{})", alternation)
+    };
+
+    let with_version =
+        if versioned { format!(r"{}(?:[-_]?([0-9]+(?:[._-][0-9a-zA-Z]+)*))?", base) } else { base };
+
+    // On Windows, executable names are case-insensitive (CL.EXE, cl.exe, Cl.exe)
+    let case_flag = if cfg!(windows) { "(?i)" } else { "" };
+    let full_pattern = format!(r"^{}{}(?:\.exe)?$", case_flag, with_version);
+    Regex::new(&full_pattern).unwrap_or_else(|_| panic!("Invalid regex pattern: {}", full_pattern))
+}
+
+/// Escape regex metacharacters that may appear in compiler executable names.
+///
+/// The only metacharacter that actually appears in the YAML-defined executable
+/// names is `+` (e.g. `c++`, `g++`, `clang++`). `regex-lite` does not expose a
+/// public `escape` helper, so we provide a minimal local one.
+fn escape_executable(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c == '+' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::probe::NoProbe;
     use super::*;
     use std::path::Path;
 
@@ -273,15 +355,24 @@ mod tests {
         Path::new(s)
     }
 
+    /// Recognizer with the probe disabled. Use this for tests that exercise
+    /// the regex/hint layer in isolation. Tests that need to verify the
+    /// probe should construct a recognizer with a `FakeProbe`.
+    fn no_probe_recognizer() -> CompilerRecognizer {
+        CompilerRecognizer::with_probe(&[], Box::new(NoProbe))
+    }
+
     #[test]
     fn test_gcc_recognition() {
-        let recognizer = CompilerRecognizer::new();
+        // Pure regex behavior. The bare names `cc` and `c++` are
+        // intentionally absent from the gcc.yaml regex: they are
+        // ambiguous (Linux=GCC, BSDs/macOS=Clang) and dispatch is owned
+        // by the probe. Tests for those names live in the probe_* group.
+        let recognizer = no_probe_recognizer();
 
         // Basic GCC names
         assert_eq!(recognizer.recognize(path("gcc")), Some(CompilerType::Gcc));
         assert_eq!(recognizer.recognize(path("g++")), Some(CompilerType::Gcc));
-        assert_eq!(recognizer.recognize(path("cc")), Some(CompilerType::Gcc));
-        assert_eq!(recognizer.recognize(path("c++")), Some(CompilerType::Gcc));
 
         // Cross-compilation variants
         assert_eq!(recognizer.recognize(path("arm-linux-gnueabi-gcc")), Some(CompilerType::Gcc));
@@ -328,11 +419,11 @@ mod tests {
     fn test_windows_exe_extensions() {
         let recognizer = CompilerRecognizer::new();
 
-        // GCC with .exe extensions
+        // GCC with .exe extensions. (`cc.exe`/`c++.exe` are intentionally
+        // absent: those names are ambiguous and the probe owns dispatch
+        // for them; the regex returns no match.)
         assert_eq!(recognizer.recognize(path("gcc.exe")), Some(CompilerType::Gcc));
         assert_eq!(recognizer.recognize(path("g++.exe")), Some(CompilerType::Gcc));
-        assert_eq!(recognizer.recognize(path("cc.exe")), Some(CompilerType::Gcc));
-        assert_eq!(recognizer.recognize(path("c++.exe")), Some(CompilerType::Gcc));
 
         // Cross-compilation variants with .exe
         assert_eq!(recognizer.recognize(path("arm-linux-gnueabi-gcc.exe")), Some(CompilerType::Gcc));
@@ -741,5 +832,192 @@ mod tests {
         } else {
             assert_eq!(upper_exe, None);
         }
+    }
+
+    // ----- Probe dispatch tests -----------------------------------------
+
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Probe that returns canned answers and counts calls.
+    struct FakeProbe {
+        answers: StdMutex<HashMap<PathBuf, CompilerType>>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeProbe {
+        fn new() -> Self {
+            Self { answers: StdMutex::new(HashMap::new()), calls: AtomicUsize::new(0) }
+        }
+
+        fn answer(self, p: &str, t: CompilerType) -> Self {
+            self.answers.lock().unwrap().insert(PathBuf::from(p), t);
+            self
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl super::super::probe::CompilerProbe for FakeProbe {
+        fn probe(&self, p: &Path) -> Option<CompilerType> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.answers.lock().unwrap().get(p).copied()
+        }
+    }
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn probe_classifies_cc_as_clang_on_bsd_like_host() {
+        // Simulates `/usr/bin/cc` resolving to Clang (FreeBSD, macOS).
+        // The relative path "cc" canonicalizes to itself when the file does
+        // not exist, so the probe key is the original PathBuf.
+        let probe = Box::new(FakeProbe::new().answer("cc", CompilerType::Clang));
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        assert_eq!(recognizer.recognize(path("cc")), Some(CompilerType::Clang));
+    }
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn probe_classifies_cc_as_gcc_on_linux_like_host() {
+        let probe = Box::new(FakeProbe::new().answer("cc", CompilerType::Gcc));
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        assert_eq!(recognizer.recognize(path("cc")), Some(CompilerType::Gcc));
+    }
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn probe_inconclusive_yields_not_recognized() {
+        // The probe is the sole classifier for ambiguous names; there is
+        // no regex fallback. When the probe returns None, recognition
+        // returns None and the dispatcher will surface NotRecognized.
+        // This matters because the previous "default to gcc" behavior
+        // produced silently wrong entries on BSD/macOS hosts where cc is
+        // Clang — exactly the bug this whole mechanism exists to fix.
+        let probe = Box::new(FakeProbe::new());
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        assert_eq!(recognizer.recognize(path("cc")), None);
+        assert_eq!(recognizer.recognize(path("c++")), None);
+    }
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn config_hint_beats_probe_and_suppresses_it() {
+        // The user's compilers: entry must win, and the probe must not run
+        // when a hint already classifies the path.
+        let compilers =
+            vec![Compiler { path: PathBuf::from("cc"), as_: Some(CompilerType::Gcc), ignore: false }];
+        let probe = Box::new(FakeProbe::new().answer("cc", CompilerType::Clang));
+        // Take a raw pointer to the FakeProbe so we can read the call count
+        // after handing ownership to the recognizer. Safe because the
+        // recognizer owns the box for the duration of the test.
+        let probe_ptr: *const FakeProbe = &*probe;
+        let recognizer = CompilerRecognizer::with_probe(&compilers, probe);
+
+        assert_eq!(recognizer.recognize(path("cc")), Some(CompilerType::Gcc));
+        let calls = unsafe { (*probe_ptr).calls() };
+        assert_eq!(calls, 0, "hint must short-circuit the probe");
+    }
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn non_ambiguous_names_are_not_probed() {
+        let probe = Box::new(FakeProbe::new());
+        let probe_ptr: *const FakeProbe = &*probe;
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        // A handful of non-ambiguous names: each must take the regex path
+        // without going through the probe at all.
+        for name in &["gcc", "clang", "g++", "clang++", "gfortran", "icx", "nvcc"] {
+            let _ = recognizer.recognize(path(name));
+        }
+
+        let calls = unsafe { (*probe_ptr).calls() };
+        assert_eq!(calls, 0, "only AMBIGUOUS_NAMES should ever reach the probe");
+    }
+
+    // Cache behavior is the responsibility of `super::super::probe::CachingProbe`
+    // and is exercised in its own test module. The recognizer simply asks the
+    // probe; whether the answer is fresh or memoized is opaque here.
+
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    fn wrapper_basenames_are_never_probed_even_under_ambiguous_paths() {
+        // ccache, distcc, sccache must reach the regex (which returns
+        // CompilerType::Wrapper). Probing them would return the underlying
+        // compiler's version and bypass wrapper unwrapping.
+        let probe = Box::new(FakeProbe::new());
+        let probe_ptr: *const FakeProbe = &*probe;
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        // The basename guard runs after canonicalization. ccache itself is
+        // not in AMBIGUOUS_NAMES so it would never enter the probe path
+        // anyway; this asserts the documented invariant explicitly.
+        assert_eq!(recognizer.recognize(path("ccache")), Some(CompilerType::Wrapper));
+        assert_eq!(recognizer.recognize(path("distcc")), Some(CompilerType::Wrapper));
+        assert_eq!(recognizer.recognize(path("sccache")), Some(CompilerType::Wrapper));
+
+        let calls = unsafe { (*probe_ptr).calls() };
+        assert_eq!(calls, 0);
+    }
+
+    // The recognizer canonicalizes ambiguous-name paths before delegating
+    // to the (caching) probe. Two argv spellings of the same compiler --
+    // e.g. reached through different symlinks -- must therefore collapse
+    // to one inner-probe call. This invariant used to be exercised
+    // implicitly by the now-removed probe_runs_at_most_once_per_canonical_path
+    // test; with caching extracted into CachingProbe, we restore explicit
+    // coverage by wiring CachingProbe over a counting probe and observing
+    // the call count after asking the recognizer to classify two
+    // symlinks pointing at the same target.
+    //
+    // Requirements: recognition-ambiguous-name-probe
+    #[test]
+    #[cfg(unix)]
+    fn distinct_paths_canonicalizing_to_same_target_share_cache_entry() {
+        use super::super::probe::CachingProbe;
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+
+        struct CountingProbe {
+            calls: Arc<AtomicUsize>,
+        }
+        impl super::super::probe::CompilerProbe for CountingProbe {
+            fn probe(&self, _: &Path) -> Option<CompilerType> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Some(CompilerType::Clang)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real-cc");
+        std::fs::write(&real, b"").expect("write real-cc");
+
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        std::fs::create_dir(&dir_a).expect("mkdir a");
+        std::fs::create_dir(&dir_b).expect("mkdir b");
+        let link_a = dir_a.join("cc");
+        let link_b = dir_b.join("cc");
+        symlink(&real, &link_a).expect("symlink a/cc -> real-cc");
+        symlink(&real, &link_b).expect("symlink b/cc -> real-cc");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingProbe { calls: Arc::clone(&calls) };
+        let probe: Box<dyn super::super::probe::CompilerProbe> = Box::new(CachingProbe::new(counting));
+        let recognizer = CompilerRecognizer::with_probe(&[], probe);
+
+        assert_eq!(recognizer.recognize(&link_a), Some(CompilerType::Clang));
+        assert_eq!(recognizer.recognize(&link_b), Some(CompilerType::Clang));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "canonicalization in the recognizer must collapse symlinks before the cache lookup"
+        );
     }
 }
