@@ -163,6 +163,45 @@ fn successful_build_multiple_sources() -> Result<()> {
     Ok(())
 }
 
+/// Regression guard for #601: pre-4.x versions of Bear dropped
+/// `-xc++-header` precompiled-header invocations from the database
+/// because the source-file heuristic did not recognize `.hpp` as a
+/// source. 4.x added `.hpp`/`.h`/`.hxx`/`.tcc` to SOURCE_EXTENSIONS
+/// (bear/src/semantic/interpreters/matchers/source.rs); no test
+/// asserts this for the -xc++-header flow. Lock it in so a future
+/// reshuffle of the extension table cannot silently drop PCH builds.
+// Requirements: output-json-compilation-database, output-compilation-entries
+#[test]
+#[cfg(all(has_executable_compiler_cxx, has_executable_shell))]
+fn precompiled_header_invocation_is_captured() -> Result<()> {
+    let env = TestEnvironment::new("precompiled_header")?;
+    env.create_source_files(&[("header.hpp", "#pragma once\nint pch_value();\n")])?;
+
+    let cmd = format!("{} -xc++-header -c header.hpp -o header.hpp.gch", filename_of(COMPILER_CXX_PATH),);
+    let script_path = env.create_shell_script("build.sh", &cmd)?;
+
+    env.run_bear_success(&[
+        "--output",
+        "compile_commands.json",
+        "--",
+        SHELL_PATH,
+        script_path.to_str().unwrap(),
+    ])?;
+
+    // The original bug was an empty database. Assert "at least one entry"
+    // plus "an entry for header.hpp", which both pins the regression
+    // (empty database) and tolerates host-dependent multi-event captures
+    // (e.g., ccache masquerade).
+    let db = env.load_compilation_database("compile_commands.json")?;
+    assert!(
+        !db.entries().is_empty(),
+        "expected at least one compilation entry for a -xc++-header invocation"
+    );
+    db.assert_contains(&CompilationEntryMatcher::new().file("header.hpp"))?;
+
+    Ok(())
+}
+
 /// Test output is overwritten when no append flag
 // Requirements: output-append
 #[test]
