@@ -923,3 +923,75 @@ fn probe_dispatches_cc_to_clang_when_version_advertises_clang() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression guard for #532: --append was unusable on large projects in the
+/// 3.x C++ implementation. The Rust rewrite (output-append.md) made it linear
+/// but no test enforces the scaling property -- the requirement file cites
+/// #532 in Notes only. This test synthesizes a large existing database and
+/// asserts the append completes well inside a linear time budget. An O(N^2)
+/// regression in the read/merge path would blow past the budget.
+// Requirements: output-append
+#[test]
+#[cfg(all(has_executable_compiler_c, has_executable_shell))]
+fn append_to_large_database_stays_within_budget() -> Result<()> {
+    let env = TestEnvironment::new("append_to_large_database")?;
+
+    // Synthesize an existing compile_commands.json with N entries. N is
+    // large enough that a quadratic regression takes much longer than the
+    // budget, but small enough that linear behaviour stays well under it.
+    let n: usize = 5_000;
+    let dir = env.test_dir().to_str().unwrap().to_string();
+    let entries: Vec<_> = (0..n)
+        .map(|i| {
+            let file = format!("file_{i}.c");
+            let out = format!("file_{i}.o");
+            serde_json::json!({
+                "directory": dir,
+                "arguments": [COMPILER_C_PATH, "-c", file, "-o", out],
+                "file": file,
+            })
+        })
+        .collect();
+    let existing = serde_json::to_string(&entries)?;
+    std::fs::write(env.test_dir().join("compile_commands.json"), existing)?;
+
+    env.create_source_files(&[("new.c", "int main() { return 0; }")])?;
+    let cmd = format!("{} -c new.c -o new.o", filename_of(COMPILER_C_PATH));
+    let script_path = env.create_shell_script("build.sh", &cmd)?;
+
+    let started = std::time::Instant::now();
+    env.run_bear_success(&[
+        "--append",
+        "--output",
+        "compile_commands.json",
+        "--",
+        SHELL_PATH,
+        script_path.to_str().unwrap(),
+    ])?;
+    let elapsed = started.elapsed();
+
+    // Soft upper bound: linear append of N+1 entries fits inside a second
+    // on any modern machine. 60s gives huge headroom for slow CI runners
+    // doing linear work, while still failing loudly on a quadratic
+    // regression (5_000^2 = 25M ops vs 5_000 ops).
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "append of one entry into a {n}-entry database took {elapsed:?}; \
+         expected linear-time behaviour"
+    );
+
+    // The N synthesized entries must survive plus at least one new entry
+    // for new.c. Some hosts (e.g. ccache masquerade in PATH) capture
+    // multiple events for a single compile; the exact count is host-
+    // dependent, but the lower bound is invariant.
+    let db = env.load_compilation_database("compile_commands.json")?;
+    assert!(
+        db.entries().len() > n,
+        "expected more than {n} entries after appending one compile to a \
+         {n}-entry database, got {}",
+        db.entries().len()
+    );
+    db.assert_contains(&CompilationEntryMatcher::new().file("new.c"))?;
+
+    Ok(())
+}
