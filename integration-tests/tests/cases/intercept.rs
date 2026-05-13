@@ -950,3 +950,63 @@ intercept:
 
     Ok(())
 }
+
+/// Regression guard for #506: 3.x serialized argv via protobuf, which rejected
+/// non-UTF-8 bytes and crashed the supervisor. 4.x replaced the wire format
+/// with JSON; `as_string` in the preload library rejects non-UTF-8 argv and
+/// silently drops only the offending event (see
+/// `intercept-preload/src/implementation.rs::report`). This test locks in
+/// "no crash + the rest of the build is still captured + events file remains
+/// valid JSON Lines" so a future change cannot reintroduce the pipeline-break.
+///
+/// Gated on `has_preload_library`: the test exercises the preload library's
+/// UTF-8 fallback path. On macOS the integration build disables preload
+/// (`is_preload_supported_at_runtime` in `integration-tests/build.rs`),
+/// and Windows has no preload mechanism at all; both fall back to wrapper
+/// mode, where argv handling lives in a different code path with its own
+/// behaviour that is not the contract under test here.
+// Requirements: interception-preload-mechanism
+#[test]
+#[cfg(all(has_preload_library, has_executable_compiler_c, has_executable_shell, has_executable_true))]
+fn non_utf8_argv_does_not_break_interception() -> Result<()> {
+    let env = TestEnvironment::new("non_utf8_argv")?;
+    env.create_source_files(&[("test.c", "int main() { return 0; }")])?;
+
+    // Two commands in one build:
+    // 1. /bin/true invoked with an argv slot containing raw non-UTF-8 bytes
+    //    (0xC3 0x28 -- a malformed UTF-8 lead-byte sequence). The shell's
+    //    command substitution preserves raw bytes verbatim. Whether bear
+    //    records this event is an implementation choice; the contract is
+    //    that bear must not crash and must not corrupt the events file.
+    // 2. A normal C compile. This event MUST survive: the regression
+    //    scenario is a non-UTF-8 byte breaking the whole capture pipeline.
+    let build_commands = [
+        format!("{} \"$(printf '\\xc3\\x28')\"", TRUE_PATH),
+        format!("{} -c test.c -o test.o", COMPILER_C_PATH),
+    ]
+    .join("\n");
+    let script_path = env.create_shell_script("build.sh", &build_commands)?;
+
+    env.run_bear_success(&[
+        "intercept",
+        "--output",
+        "events.json",
+        "--",
+        SHELL_PATH,
+        script_path.to_str().unwrap(),
+    ])?;
+
+    // Events file must parse cleanly. `load_events_file` reads via
+    // `read_to_string`, which fails on any non-UTF-8 byte in the file --
+    // so the parse itself is the regression assertion for "no corrupted
+    // output".
+    let events = env.load_events_file("events.json")?;
+
+    // The normal compile must still be in the events file. A regression
+    // that crashes the collector on the first non-UTF-8 event would drop
+    // every subsequent event too.
+    let compiler_matcher = event_matcher!(executable_path: COMPILER_C_PATH.to_string());
+    events.assert_contains(&compiler_matcher)?;
+
+    Ok(())
+}
