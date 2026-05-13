@@ -48,8 +48,24 @@ supported platforms:
      `-Wl,-exported_symbols_list,...`, `-Wl,-rpath,@loader_path`.
 
 `INTERCEPT_FAMILY` in `build.rs` lists the symbols `src/c/shim.c`
-exports. Source of truth is `src/c/shim.c` itself; keep them in sync
-when adding or removing an intercepted function.
+exports. Source of truth is `src/c/shim.c` itself.
+
+Adding or removing an intercepted function is a three-place edit:
+
+1. `src/c/shim.c` - the `EXPORT` wrapper itself (and the matching
+   `extern` declaration of the `rust_<name>` implementation).
+2. `intercept-preload/build.rs::INTERCEPT_FAMILY` - so the symbol
+   passes the filter against `platform_checks::DETECTED_SYMBOLS`
+   and is written into the version script / exports list.
+3. `platform-checks/build.rs::SYMBOL_PROBES` - so the symbol is
+   probed on the host at all. If it is not listed here it never
+   enters `DETECTED_SYMBOLS`, and the `INTERCEPT_FAMILY` filter
+   silently drops it, leaving the wrapper hidden by `local: *;`.
+
+Miss any one of the three and the wrapper compiles but is invisible
+to the dynamic linker, so libc handles the call instead of us.
+Pairs that travel together (e.g. `popen`/`pclose`) each need their
+own entry in all three places.
 
 ## Before modifying
 
