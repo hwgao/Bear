@@ -9,4 +9,4 @@ RUN dnf -y install curl ca-certificates git gh pandoc \
     && dnf -y clean all \
     && rm -rf /var/cache/dnf \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default \
-    && curl -fsSL https://claude.ai/install.sh | bash
+    && curl -fsSL https://claude.ai/install.sh | sh

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Verify that every `implemented` requirement has at least one test
 # referencing it via a `Requirements: <id>` tag.
 #
@@ -10,9 +10,9 @@
 #   1 - at least one implemented requirement has zero references
 #   2 - invocation error (e.g. script run from wrong directory)
 
-set -euo pipefail
+set -eu
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
 if [ ! -d "${repo_root}/requirements" ]; then
@@ -20,11 +20,9 @@ if [ ! -d "${repo_root}/requirements" ]; then
     exit 2
 fi
 
-search_roots=(
-    "${repo_root}/bear"
-    "${repo_root}/intercept-preload"
-    "${repo_root}/integration-tests"
-)
+# Space-separated search roots. Word splitting on the expansion below is
+# intentional, so the paths must not contain spaces (they don't).
+search_roots="${repo_root}/bear ${repo_root}/intercept-preload ${repo_root}/integration-tests"
 
 missing=0
 checked=0
@@ -53,7 +51,8 @@ for file in "${repo_root}/requirements"/*.md; do
     # "output-path-format".
     pattern="Requirements:.*\\b${base}\\b"
 
-    if grep -RnE "${pattern}" "${search_roots[@]}" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if grep -RnE "${pattern}" ${search_roots} >/dev/null 2>&1; then
         :
     else
         echo "MISSING: ${base} (status: implemented) has no test tagged with its ID"
