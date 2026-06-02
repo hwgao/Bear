@@ -166,10 +166,19 @@ Protection strips `DYLD_INSERT_LIBRARIES` for system executables. Bear
 detects SIP at startup via `csrutil status` and falls back to wrapper
 mode. Users who disable SIP can force preload mode via configuration.
 
-**Preload conflicts with sandboxes** (issue #675): Gentoo's sandbox
-also uses `LD_PRELOAD`. The two libraries can interfere with each
-other, causing test failures. Bear preserves co-resident libraries but
-cannot prevent all interactions.
+**Preload conflicts with sandboxes** (issues #675, #699): Gentoo's
+sandbox (`libsandbox.so`) is itself an `LD_PRELOAD` library hooking the
+same `exec` family. When a build step clears the environment (`env -i`)
+and re-execs, Bear re-inserts its library first, but a co-resident
+sandbox library downstream in the exec chain can re-assert its own
+`LD_PRELOAD` and drop Bear's entry, so the grandchild is not
+intercepted. Bear cannot prevent this without refusing to delegate to
+the other library, which would disable the sandbox and alter the build.
+This surfaces when Bear's own test suite is run *inside* the sandbox
+(e.g. `FEATURES=test` during `emerge`); the fix is packaging-side -
+keep `RESTRICT="test"` or run the test phase with the sandbox disabled
+(`FEATURES="-sandbox -usersandbox"`). Non-sandboxed interception is
+unaffected. See bugs.gentoo.org/973619.
 
 **Affects all child processes** (issues #444, #556): `LD_PRELOAD`
 applies to every process spawned during the build, not just compilers.

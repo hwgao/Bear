@@ -75,6 +75,13 @@
 //!   functions (e.g., i686), two chained shim layers for `execle` may
 //!   corrupt the stack — this is the likely cause of the SIGSEGV in
 //!   issue #675 on x86 (32-bit).
+//!
+//! Confirmed in the field by issue #699 (bugs.gentoo.org/973619): when
+//! Bear's own suite runs inside Gentoo's `emerge` sandbox, `libsandbox.so`
+//! strips `bear-lib` from `LD_PRELOAD` after an `env -i`, so the env-clear
+//! tests here fail. This is a packaging-side concern, not a Bear defect -
+//! see the "Preload conflicts with sandboxes" limitation in
+//! `requirements/interception-preload-mechanism.md`.
 
 use crate::fixtures::constants::*;
 use crate::fixtures::infrastructure::*;
