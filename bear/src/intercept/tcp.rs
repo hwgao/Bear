@@ -66,40 +66,97 @@ impl CollectorOnTcp {
     /// Single-threaded implementation of the collector.
     ///
     /// The collector listens to the TCP port and accepts incoming connections.
-    /// When a connection is accepted, the collector reads the executions from
-    /// the connection and emits them.
+    /// When a connection is accepted, the collector reads the execution from
+    /// the connection and emits it.
+    ///
+    /// # Graceful shutdown
+    ///
+    /// Reporters open a fresh connection per execution and write the whole
+    /// length-prefixed record synchronously before the intercepted process
+    /// execs. By the time a build finishes, every such report has completed
+    /// its TCP handshake and is sitting in the listener's accept backlog.
+    ///
+    /// When `shutdown` is requested, the backlog may therefore still hold
+    /// legitimate, fully-written reports. To avoid losing them, once the
+    /// shutdown flag is observed the iterator switches the listener to
+    /// non-blocking mode and drains every queued connection (reading each
+    /// real record) until the backlog is empty (`WouldBlock`), and only then
+    /// returns `None`. The drain always terminates because the backlog is
+    /// finite and no new connections arrive after the build has exited.
+    ///
+    /// The throwaway "wake" connection opened by `shutdown` writes no bytes,
+    /// so its first read yields end-of-file; it is recognised and skipped
+    /// rather than being reported as an error.
     pub fn executions(&self) -> impl Iterator<Item = Result<Execution, ReporterError>> + '_ {
         let listener = &self.listener;
         let shutdown = &self.shutdown;
+        // Once true, we are draining the backlog with non-blocking accepts.
+        let mut draining = false;
 
         std::iter::from_fn(move || {
-            if shutdown.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            match listener.accept() {
-                Ok((mut connection, _)) => {
-                    if shutdown.load(Ordering::Relaxed) {
-                        let _ = connection.shutdown(std::net::Shutdown::Both);
-                        None
-                    } else {
-                        let result = ExecutionWireSerializer::read(&mut connection);
-                        let _ = connection.shutdown(std::net::Shutdown::Both);
-                        Some(result)
+            loop {
+                if !draining && shutdown.load(Ordering::Acquire) {
+                    // Enter drain mode: stop blocking on accept so the loop is
+                    // guaranteed to terminate, and pick up any connections the
+                    // reporters already queued before shutdown was requested.
+                    if listener.set_nonblocking(true).is_err() {
+                        return None;
                     }
+                    draining = true;
                 }
-                Err(err) => Some(Err(ReporterError::Network(err))),
+
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        // Read the record before closing. A connection that
+                        // does not deliver a complete record (the wake
+                        // connection from `shutdown`, or any aborted report) is
+                        // skipped rather than surfaced as an error.
+                        let execution = Self::read_connection(&mut connection);
+                        let _ = connection.shutdown(std::net::Shutdown::Both);
+                        match execution {
+                            Some(execution) => return Some(Ok(execution)),
+                            None => continue,
+                        }
+                    }
+                    Err(err) if draining && err.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Backlog fully drained: nothing left to accept.
+                        return None;
+                    }
+                    Err(err) => return Some(Err(ReporterError::Network(err))),
+                }
             }
         })
     }
 
+    /// Reads a single execution from an accepted connection, if the peer sent
+    /// a complete record.
+    ///
+    /// Returns `None` when the connection does not yield a usable record. The
+    /// empty wake connection opened by `shutdown` closes without sending any
+    /// bytes - a clean EOF on Linux, but a reset or other platform-specific
+    /// error on macOS/BSD - and an aborted or truncated report fails partway
+    /// through. None of these are data events; reporting failures are
+    /// non-fatal by contract, so such connections are skipped (logged at
+    /// debug) rather than surfaced as collector errors. Keying on "did the
+    /// peer deliver a complete record" instead of on a specific I/O error kind
+    /// keeps the behavior identical across platforms.
+    fn read_connection(connection: &mut TcpStream) -> Option<Execution> {
+        match ExecutionWireSerializer::read(connection) {
+            Ok(execution) => Some(execution),
+            Err(err) => {
+                log::debug!("Skipping connection without a complete record: {err}");
+                None
+            }
+        }
+    }
+
     /// Stops the collector by flipping the shutdown flag and connecting to the collector.
     ///
-    /// The collector is stopped when the `produce` method sees the shutdown flag.
-    /// To signal the collector to stop, we connect to the collector to unblock the
-    /// `accept` call to check the shutdown flag.
+    /// The collector is stopped when the `executions` iterator sees the shutdown
+    /// flag. To signal the collector to stop, we connect to it to unblock the
+    /// blocking `accept` call so it can observe the flag and drain the backlog.
     pub fn shutdown(&self) -> Result<(), ReporterError> {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
 
         let address = self.listener.local_addr()?;
         let _ = TcpStream::connect(address).map_err(ReporterError::Network)?;
@@ -222,6 +279,58 @@ mod tests {
         assert_eq!(fixtures::EXECUTIONS.len(), received.len());
         for execution in received {
             assert!(fixtures::EXECUTIONS.contains(&execution));
+        }
+    }
+
+    // Regression test for issue #704: reports already queued in the accept
+    // backlog must not be dropped when shutdown is requested.
+    //
+    // This reproduces the shutdown race deterministically without relying on
+    // arch-specific timing: all reports are sent and fully flushed *before*
+    // `shutdown` is called and *before* the collector starts accepting. The
+    // reports therefore sit in the listener's accept backlog at the moment
+    // shutdown flips the flag, exactly as the last compiler's report does at
+    // the end of a real build. A correct collector drains the backlog and
+    // yields every queued execution; the pre-fix collector discarded the
+    // backlog and lost them.
+    //
+    // Requirements: interception-preload-mechanism
+    #[test]
+    fn tcp_collector_drains_backlog_on_shutdown() {
+        let (collector, address) = CollectorOnTcp::new().unwrap();
+        let collector_arc = Arc::new(collector);
+
+        // Send and fully flush every report up front. Because the reporter
+        // opens a connection, writes the whole record, and closes, each report
+        // ends up queued in the accept backlog before we ever accept.
+        for execution in fixtures::EXECUTIONS.iter() {
+            let reporter = ReporterOnTcp::new(address);
+            reporter.report(execution.clone()).expect("report should succeed");
+        }
+
+        // Request shutdown while every report is still sitting in the backlog.
+        collector_arc.shutdown().unwrap();
+
+        // Drain on a worker thread guarded by a timeout so a regression that
+        // hangs (instead of dropping) is reported as a failure, not a hang.
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<Vec<Execution>>(0);
+        let drain_thread = {
+            let tcp_collector = Arc::clone(&collector_arc);
+            std::thread::spawn(move || {
+                let received: Vec<Execution> = tcp_collector.executions().filter_map(Result::ok).collect();
+                let _ = done_tx.send(received);
+            })
+        };
+
+        let received = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out draining the shutdown backlog");
+        drain_thread.join().unwrap();
+
+        // Every queued report must survive shutdown.
+        assert_eq!(fixtures::EXECUTIONS.len(), received.len());
+        for execution in fixtures::EXECUTIONS.iter() {
+            assert!(received.contains(execution));
         }
     }
 

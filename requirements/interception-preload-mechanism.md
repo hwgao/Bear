@@ -203,6 +203,15 @@ Given a parallel build with multiple source files:
 > then all four compilations appear in `compile_commands.json`,
 > and no reports are lost due to concurrent TCP connections.
 
+Given a build whose last compiler reports immediately before the build
+process exits:
+
+> When that final report is still queued in the collector's accept
+> backlog at the moment shutdown is requested,
+> then the collector drains the backlog before stopping,
+> and that last compilation still appears in `compile_commands.json`
+> (no entry is lost to the shutdown race -- see issue #704).
+
 Given a build that invokes non-compiler commands:
 
 > When the build runs `cp`, `mkdir`, and `cc -c test.c`,
